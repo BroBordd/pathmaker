@@ -2,7 +2,7 @@
 
 Pathmaker is a Python utility designed to generate navmesh (pathfinding) data for BombSquad bots by processing collision mesh files.
 
-It converts the proprietary .cob (or .bob) collision mesh format, which contains geometry information, into a structured JSON graph format suitable for pathfinding algorithms.
+It converts the proprietary .cob collision mesh format, which contains geometry information, into a structured JSON graph format suitable for pathfinding algorithms.
 
 ## What it Does
 
@@ -20,10 +20,6 @@ The input file is typically found in the game's files within the meshes folder.
 **Example File Path:**
 ```bash
 [game_path]/meshes/mapNameLevelCollide.cob
-```
-or
-```bash
-[game_path]/meshes/mapNameLevelCollide.bob
 ```
 
 ### 2. Run the Script
