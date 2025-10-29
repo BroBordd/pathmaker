@@ -18,13 +18,13 @@ It converts the proprietary .cob (or .bob) collision mesh format, which contains
 The input file is typically found in the game's files within the meshes folder.
 
 **Example File Path:**
-zzzbash
+```bash
 [game_path]/meshes/mapNameLevelCollide.cob
-zzz
+```
 or
-zzzbash
+```bash
 [game_path]/meshes/mapNameLevelCollide.bob
-zzz
+```
 
 ### 2. Run the Script
 
@@ -32,17 +32,17 @@ The pathmaker.py script takes the input file and an optional output file path.
 
 **Basic Usage:**
 
-zzzbash
+```bash
 python pathmaker.py <input.cob>
-zzz
+```
 
 This will automatically generate a file named <input>_navguide.json (e.g., cragCastleLevelCollide_navguide.json).
 
 **Usage with Custom Output Name:**
 
-zzzbash
+```bash
 python pathmaker.py <input.cob> <output_filename.json>
-zzz
+```
 
 ### Output Files
 
