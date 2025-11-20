@@ -1,289 +1,219 @@
-# Copyright 2025 - Solely by BrotherBoard
-# Intended for personal usage only
-# Bug? Feedback? Telegram >> @BroBordd
-
 import struct
 import json
 import math
-from collections import defaultdict
+import sys
+import os
+import argparse
 from typing import List, Tuple, Dict, Set
 
-COB_FILE_ID = 13466
+# --- Utility Classes ---
 
 class Vector3:
-    def __init__(self, x: float, y: float, z: float):
-        self.x = x
-        self.y = y
-        self.z = z
-    
-    def __repr__(self):
-        return f"Vector3({self.x:.3f}, {self.y:.3f}, {self.z:.3f})"
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
     
     def to_tuple(self):
         return (self.x, self.y, self.z)
-    
-    def distance_to(self, other):
-        dx = self.x - other.x
-        dy = self.y - other.y
-        dz = self.z - other.z
-        return math.sqrt(dx*dx + dy*dy + dz*dz)
-    
-    def __add__(self, other):
-        return Vector3(self.x + other.x, self.y + other.y, self.z + other.z)
-    
-    def __mul__(self, scalar):
-        return Vector3(self.x * scalar, self.y * scalar, self.z * scalar)
-    
-    def __truediv__(self, scalar):
-        return Vector3(self.x / scalar, self.y / scalar, self.z / scalar)
 
-class Face:
-    def __init__(self, v1_idx: int, v2_idx: int, v3_idx: int, normal: Vector3):
-        self.indices = [v1_idx, v2_idx, v3_idx]
-        self.normal = normal
-        self.center = None
-        self.is_walkable = False
-        self.neighbors = []
-    
-    def compute_center(self, vertices: List[Vector3]):
-        v1, v2, v3 = [vertices[i] for i in self.indices]
-        self.center = (v1 + v2 + v3) / 3.0
-    
-    def check_walkable(self, max_slope: float = 0.7):
-        self.is_walkable = self.normal.y > max_slope
+# --- PathMaker Core Logic ---
 
-class COBMesh:
-    def __init__(self, filepath: str):
+class PathMaker:
+    def __init__(self, filepath):
         self.filepath = filepath
-        self.vertices: List[Vector3] = []
-        self.faces: List[Face] = []
-        self.load()
-    
-    def load(self):
+        self.raw_vertices: List[Vector3] = []
+        self.raw_faces: List[Tuple[int, int, int]] = [] 
+        
+        self.unique_vertices: List[Vector3] = [] 
+        self.welded_faces: List[Tuple[int, int, int]] = [] 
+        
+        self.nodes: List[Dict] = [] 
+        self.adjacency: Dict[int, List[int]] = {} 
+        
+        # Config
+        self.slope_limit = 0.6 
+
+    def read_cob(self):
+        """Parses the binary COB file."""
         with open(self.filepath, 'rb') as f:
             magic = struct.unpack('I', f.read(4))[0]
-            if magic != COB_FILE_ID:
-                raise ValueError(f"Invalid COB file. Expected magic {COB_FILE_ID}, got {magic}")
+            if magic != 13466: raise ValueError("Invalid COB magic number")
             
             vertex_count = struct.unpack('I', f.read(4))[0]
             face_count = struct.unpack('I', f.read(4))[0]
             
-            print(f"Loading COB: {vertex_count} vertices, {face_count} faces")
-            
             for _ in range(vertex_count):
-                x, y, z = struct.unpack('fff', f.read(12))
-                self.vertices.append(Vector3(x, y, z))
-            
-            face_indices = []
-            for _ in range(face_count):
-                i1, i2, i3 = struct.unpack('III', f.read(12))
-                face_indices.append((i1, i2, i3))
-            
-            for i in range(face_count):
-                nx, ny, nz = struct.unpack('fff', f.read(12))
-                normal = Vector3(nx, ny, nz)
-                indices = face_indices[i]
-                face = Face(indices[0], indices[1], indices[2], normal)
-                face.compute_center(self.vertices)
-                face.check_walkable()
-                self.faces.append(face)
+                self.raw_vertices.append(Vector3(*struct.unpack('fff', f.read(12))))
 
-class NavigationGuide:
-    def __init__(self, mesh: COBMesh):
-        self.mesh = mesh
-        self.nav_nodes: List[Dict] = []
-        self.edges: List[Tuple[int, int, float]] = []
-        self.grid_size = 1.0
-        self.spatial_grid: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
-    
-    def generate(self):
-        print("Generating navigation guide...")
+            for _ in range(face_count):
+                self.raw_faces.append(struct.unpack('III', f.read(12)))
+            # Note: We stop reading here, skipping normals/UVs as they are not needed for graph generation
+
+    def weld_vertices(self):
+        """Merges vertices that are in the same position to connect mesh chunks."""
+        vertex_map: Dict[Tuple[float, float, float], int] = {} 
+        old_to_new_indices: Dict[int, int] = {}
         
-        walkable_faces = [i for i, face in enumerate(self.mesh.faces) if face.is_walkable]
-        print(f"Found {len(walkable_faces)} walkable faces out of {len(self.mesh.faces)} total")
-        
-        for face_idx in walkable_faces:
-            face = self.mesh.faces[face_idx]
-            node = {
-                'id': len(self.nav_nodes),
-                'position': face.center.to_tuple(),
-                'normal': face.normal.to_tuple(),
-                'face_idx': face_idx,
-                'neighbors': []
-            }
-            self.nav_nodes.append(node)
+        for i, v in enumerate(self.raw_vertices):
+            # Key uses rounded values to handle float inaccuracies
+            key = (round(v.x, 3), round(v.y, 3), round(v.z, 3))
             
-            grid_key = self._get_grid_key(face.center)
-            self.spatial_grid[grid_key].append(node['id'])
-        
-        self._connect_neighbors()
-        
-        for node in self.nav_nodes:
-            node_pos = Vector3(*node['position'])
-            for neighbor_id in node['neighbors']:
-                neighbor_pos = Vector3(*self.nav_nodes[neighbor_id]['position'])
-                distance = node_pos.distance_to(neighbor_pos)
-                self.edges.append((node['id'], neighbor_id, distance))
-        
-        print(f"Generated {len(self.nav_nodes)} navigation nodes with {len(self.edges)} edges")
-    
-    def _get_grid_key(self, pos: Vector3) -> Tuple[int, int, int]:
-        return (
-            int(pos.x / self.grid_size),
-            int(pos.y / self.grid_size),
-            int(pos.z / self.grid_size)
-        )
-    
-    def _connect_neighbors(self):
-        print("Connecting navigation nodes...")
-        
-        vertex_to_faces: Dict[int, List[int]] = defaultdict(list)
-        for node in self.nav_nodes:
-            face_idx = node['face_idx']
-            face = self.mesh.faces[face_idx]
-            for vertex_idx in face.indices:
-                vertex_to_faces[vertex_idx].append(node['id'])
-        
-        for node in self.nav_nodes:
-            face = self.mesh.faces[node['face_idx']]
-            connected = set()
+            if key not in vertex_map:
+                new_idx = len(self.unique_vertices)
+                self.unique_vertices.append(v)
+                vertex_map[key] = new_idx
             
-            for vertex_idx in face.indices:
-                for neighbor_node_id in vertex_to_faces[vertex_idx]:
-                    if neighbor_node_id != node['id'] and neighbor_node_id not in connected:
-                        node_pos = Vector3(*node['position'])
-                        neighbor_pos = Vector3(*self.nav_nodes[neighbor_node_id]['position'])
-                        distance = node_pos.distance_to(neighbor_pos)
-                        
-                        if distance < 5.0:
-                            node['neighbors'].append(neighbor_node_id)
-                            connected.add(neighbor_node_id)
-    
-    def compute_bounds(self) -> Dict:
-        if not self.mesh.vertices:
-            return {'min': (0, 0, 0), 'max': (0, 0, 0)}
+            old_to_new_indices[i] = vertex_map[key]
+            
+        # Rebuild faces with welded indices
+        for f in self.raw_faces:
+            new_face = (
+                old_to_new_indices[f[0]],
+                old_to_new_indices[f[1]],
+                old_to_new_indices[f[2]]
+            )
+            # Add only non-degenerate triangles
+            if new_face[0] != new_face[1] and new_face[1] != new_face[2]:
+                self.welded_faces.append(new_face)
+                
+    def generate_graph(self):
+        """Builds the navigation graph using walkable face centroids as nodes."""
+        face_map: Dict[int, int] = {}
         
-        min_x = min(v.x for v in self.mesh.vertices)
-        max_x = max(v.x for v in self.mesh.vertices)
-        min_y = min(v.y for v in self.mesh.vertices)
-        max_y = max(v.y for v in self.mesh.vertices)
-        min_z = min(v.z for v in self.mesh.vertices)
-        max_z = max(v.z for v in self.mesh.vertices)
+        for i, indices in enumerate(self.welded_faces):
+            v1, v2, v3 = (self.unique_vertices[idx] for idx in indices)
+            
+            # Cross product for Normal calculation (v2-v1) x (v3-v1)
+            ux, uy, uz = v2.x - v1.x, v2.y - v1.y, v2.z - v1.z
+            vx, vy, vz = v3.x - v1.x, v3.y - v1.y, v3.z - v1.z
+            nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+            
+            length = math.sqrt(nx*nx + ny*ny + nz*nz)
+            if length == 0: continue
+            ny /= length
+            
+            # Check slope (Walkability: ny > 0.6)
+            if ny > self.slope_limit:
+                center = Vector3(
+                    (v1.x + v2.x + v3.x) / 3.0,
+                    (v1.y + v2.y + v3.y) / 3.0,
+                    (v1.z + v2.z + v3.z) / 3.0
+                )
+                node_idx = len(self.nodes)
+                self.nodes.append({
+                    'id': node_idx,
+                    'p': [round(center.x, 3), round(center.y, 3), round(center.z, 3)]
+                })
+                face_map[i] = node_idx
+                self.adjacency[node_idx] = []
+
+        # Build Connections (Adjacency List from shared edges)
+        edge_to_nodes: Dict[Tuple[int, int], List[int]] = {}
         
-        return {
-            'min': (min_x, min_y, min_z),
-            'max': (max_x, max_y, max_z),
-            'center': ((min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2),
-            'size': (max_x - min_x, max_y - min_y, max_z - min_z)
-        }
-    
-    def save_json(self, output_path: str):
-        bounds = self.compute_bounds()
-        
-        data = {
-            'version': '1.0',
-            'source_file': self.mesh.filepath,
-            'bounds': bounds,
-            'node_count': len(self.nav_nodes),
-            'edge_count': len(self.edges),
-            'nodes': self.nav_nodes,
-            'edges': [[e[0], e[1], round(e[2], 3)] for e in self.edges],
-            'metadata': {
-                'total_faces': len(self.mesh.faces),
-                'walkable_faces': len(self.nav_nodes),
-                'grid_size': self.grid_size
-            }
-        }
-        
+        for face_idx, node_idx in face_map.items():
+            indices = self.welded_faces[face_idx]
+            edges = [
+                tuple(sorted((indices[0], indices[1]))),
+                tuple(sorted((indices[1], indices[2]))),
+                tuple(sorted((indices[2], indices[0])))
+            ]
+            for edge in edges:
+                if edge not in edge_to_nodes: edge_to_nodes[edge] = []
+                edge_to_nodes[edge].append(node_idx)
+
+        for nodes in edge_to_nodes.values():
+            if len(nodes) > 1:
+                for i in range(len(nodes)):
+                    for j in range(i + 1, len(nodes)):
+                        u, v = nodes[i], nodes[j]
+                        if v not in self.adjacency[u]:
+                            self.adjacency[u].append(v)
+                            self.adjacency[v].append(u)
+                            
+    def save_json(self, output_path):
+        """Writes the graph to a JSON file."""
+        data = { "nodes": self.nodes, "adj": self.adjacency }
         with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f)
+
+# --- Main Execution ---
+
+def process_file(cob_path: str, output_dir: str):
+    """Handles the processing of a single COB file."""
+    try:
+        filename = os.path.basename(cob_path)
+        json_filename = filename.replace('.cob', '.json')
+        output_path = os.path.join(output_dir, json_filename)
         
-        print(f"Navigation guide saved to {output_path}")
-    
-    def save_simplified_json(self, output_path: str, max_nodes: int = 500):
-        if len(self.nav_nodes) <= max_nodes:
-            self.save_json(output_path)
-            return
+        print(f"--- Processing: {filename} ---")
         
-        print(f"Simplifying navigation mesh from {len(self.nav_nodes)} to ~{max_nodes} nodes...")
+        pm = PathMaker(cob_path)
+        pm.read_cob()
+        pm.weld_vertices()
+        pm.generate_graph()
+        pm.save_json(output_path)
         
-        step = len(self.nav_nodes) // max_nodes
-        simplified_nodes = self.nav_nodes[::step][:max_nodes]
-        
-        node_id_map = {node['id']: i for i, node in enumerate(simplified_nodes)}
-        simplified_edges = []
-        
-        for i, node in enumerate(simplified_nodes):
-            node['id'] = i
-            new_neighbors = []
-            for neighbor_id in node['neighbors']:
-                if neighbor_id in node_id_map:
-                    new_neighbors.append(node_id_map[neighbor_id])
-            node['neighbors'] = new_neighbors
-            
-            for neighbor_id in new_neighbors:
-                pos1 = Vector3(*node['position'])
-                pos2 = Vector3(*simplified_nodes[neighbor_id]['position'])
-                distance = pos1.distance_to(pos2)
-                simplified_edges.append((i, neighbor_id, distance))
-        
-        bounds = self.compute_bounds()
-        data = {
-            'version': '1.0-simplified',
-            'source_file': self.mesh.filepath,
-            'bounds': bounds,
-            'node_count': len(simplified_nodes),
-            'edge_count': len(simplified_edges),
-            'nodes': simplified_nodes,
-            'edges': [[e[0], e[1], round(e[2], 3)] for e in simplified_edges],
-            'metadata': {
-                'original_node_count': len(self.nav_nodes),
-                'simplification_ratio': len(simplified_nodes) / len(self.nav_nodes)
-            }
-        }
-        
-        with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"Simplified navigation guide saved to {output_path}")
+        print(f"SUCCESS: Saved to {output_path}")
+        return True
+
+    except Exception as e:
+        print(f"ERROR: Failed to process {cob_path}. Reason: {e}")
+        return False
 
 def main():
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python pathmaker.py <input.cob> [output.json]")
-        print("Example: python pathmaker.py cragCastleLevelCollide.cob cragCastle_navguide.json")
-        sys.exit(1)
-    
-    input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else input_file.replace('.cob', '_navguide.json')
-    
-    try:
-        mesh = COBMesh(input_file)
-        
-        nav_guide = NavigationGuide(mesh)
-        nav_guide.generate()
-        
-        nav_guide.save_json(output_file)
-        
-        if len(nav_guide.nav_nodes) > 500:
-            simplified_output = output_file.replace('.json', '_simplified.json')
-            nav_guide.save_simplified_json(simplified_output, max_nodes=500)
-        
-        print("\n=== Navigation Guide Summary ===")
-        print(f"Input: {input_file}")
-        print(f"Output: {output_file}")
-        print(f"Nodes: {len(nav_guide.nav_nodes)}")
-        print(f"Edges: {len(nav_guide.edges)}")
-        bounds = nav_guide.compute_bounds()
-        print(f"Bounds: {bounds['size']}")
-        print("\nNavigation guide generation complete!")
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+    parser = argparse.ArgumentParser(
+        description="PathMaker V3: Batch converts all .cob files in a folder to navigation graph JSON files.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "input_folder",
+        type=str,
+        help="Folder containing .cob collision mesh files to convert"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        default="out",
+        help="Output folder name for JSON files (default: 'out')"
+    )
+    args = parser.parse_args()
+
+    input_dir = args.input_folder
+    output_dir = args.output
+
+    # Validate input folder
+    if not os.path.isdir(input_dir):
+        print(f"ERROR: Input folder not found: '{input_dir}'")
         sys.exit(1)
 
-if __name__ == '__main__':
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Input folder: {input_dir}")
+    print(f"Output folder: {output_dir}\n")
+
+    # Find all .cob files
+    cob_files = [
+        os.path.join(input_dir, f) 
+        for f in os.listdir(input_dir) 
+        if f.lower().endswith('.cob')
+    ]
+    
+    if not cob_files:
+        print(f"No .cob files found in: {input_dir}")
+        sys.exit(0)
+
+    print(f"Found {len(cob_files)} .cob file(s) to process.\n")
+
+    # Process all files
+    success_count = 0
+    for cob_path in cob_files:
+        if process_file(cob_path, output_dir):
+            success_count += 1
+        print()
+        
+    print("=" * 50)
+    print(f"Batch Processing Complete: {success_count}/{len(cob_files)} files converted successfully")
+    print(f"Output location: {os.path.abspath(output_dir)}")
+    print("=" * 50)
+
+if __name__ == "__main__":
     main()
