@@ -3,217 +3,193 @@ import json
 import math
 import sys
 import os
-import argparse
-from typing import List, Tuple, Dict, Set
-
-# --- Utility Classes ---
 
 class Vector3:
     def __init__(self, x, y, z):
         self.x, self.y, self.z = x, y, z
-    
-    def to_tuple(self):
-        return (self.x, self.y, self.z)
-
-# --- PathMaker Core Logic ---
+    def __repr__(self): return f"({self.x:.2f}, {self.y:.2f}, {self.z:.2f})"
+    def dist_sq(self, o): return (self.x-o.x)**2 + (self.y-o.y)**2 + (self.z-o.z)**2
 
 class PathMaker:
     def __init__(self, filepath):
         self.filepath = filepath
-        self.raw_vertices: List[Vector3] = []
-        self.raw_faces: List[Tuple[int, int, int]] = [] 
+        self.raw_vertices = []
+        self.raw_faces = [] 
         
-        self.unique_vertices: List[Vector3] = [] 
-        self.welded_faces: List[Tuple[int, int, int]] = [] 
+        self.nodes = [] 
+        self.adjacency = {} 
         
-        self.nodes: List[Dict] = [] 
-        self.adjacency: Dict[int, List[int]] = {} 
-        
-        # Config
-        self.slope_limit = 0.6 
+        # CONFIG
+        self.slope_limit = 0.5  # Lower = Allows steeper ramps
+        self.bridge_dist = 0.75 # Distance to force-connect gaps (Fixes U-Turns)
+        self.subdivide_passes = 1 # 1 pass = 4x density. 
 
     def read_cob(self):
-        """Parses the binary COB file."""
         with open(self.filepath, 'rb') as f:
-            magic = struct.unpack('I', f.read(4))[0]
-            if magic != 13466: raise ValueError("Invalid COB magic number")
-            
-            vertex_count = struct.unpack('I', f.read(4))[0]
-            face_count = struct.unpack('I', f.read(4))[0]
-            
-            for _ in range(vertex_count):
-                self.raw_vertices.append(Vector3(*struct.unpack('fff', f.read(12))))
+            if struct.unpack('I', f.read(4))[0] != 13466: raise ValueError("Bad Magic")
+            vc = struct.unpack('I', f.read(4))[0]
+            fc = struct.unpack('I', f.read(4))[0]
+            self.raw_vertices = [Vector3(*struct.unpack('fff', f.read(12))) for _ in range(vc)]
+            self.raw_faces = [struct.unpack('III', f.read(12)) for _ in range(fc)]
 
-            for _ in range(face_count):
-                self.raw_faces.append(struct.unpack('III', f.read(12)))
-            # Note: We stop reading here, skipping normals/UVs as they are not needed for graph generation
-
-    def weld_vertices(self):
-        """Merges vertices that are in the same position to connect mesh chunks."""
-        vertex_map: Dict[Tuple[float, float, float], int] = {} 
-        old_to_new_indices: Dict[int, int] = {}
+    def subdivide_geometry(self):
+        """
+        Splits every triangle into 4 smaller triangles.
+        """
+        if self.subdivide_passes == 0: return
         
-        for i, v in enumerate(self.raw_vertices):
-            # Key uses rounded values to handle float inaccuracies
-            key = (round(v.x, 3), round(v.y, 3), round(v.z, 3))
-            
-            if key not in vertex_map:
-                new_idx = len(self.unique_vertices)
-                self.unique_vertices.append(v)
-                vertex_map[key] = new_idx
-            
-            old_to_new_indices[i] = vertex_map[key]
-            
-        # Rebuild faces with welded indices
+        new_faces = []
+        midpoint_cache = {}
+
+        def get_midpoint(i1, i2):
+            key = tuple(sorted((i1, i2)))
+            if key in midpoint_cache: return midpoint_cache[key]
+            v1, v2 = self.raw_vertices[i1], self.raw_vertices[i2]
+            mid = Vector3((v1.x+v2.x)/2, (v1.y+v2.y)/2, (v1.z+v2.z)/2)
+            idx = len(self.raw_vertices)
+            self.raw_vertices.append(mid)
+            midpoint_cache[key] = idx
+            return idx
+
         for f in self.raw_faces:
-            new_face = (
-                old_to_new_indices[f[0]],
-                old_to_new_indices[f[1]],
-                old_to_new_indices[f[2]]
-            )
-            # Add only non-degenerate triangles
-            if new_face[0] != new_face[1] and new_face[1] != new_face[2]:
-                self.welded_faces.append(new_face)
-                
+            v0, v1, v2 = f[0], f[1], f[2]
+            a = get_midpoint(v0, v1)
+            b = get_midpoint(v1, v2)
+            c = get_midpoint(v2, v0)
+            new_faces.extend([(v0, a, c), (v1, b, a), (v2, c, b), (a, b, c)])
+            
+        self.raw_faces = new_faces
+
     def generate_graph(self):
-        """Builds the navigation graph using walkable face centroids as nodes."""
-        face_map: Dict[int, int] = {}
+        face_map = {} 
         
-        for i, indices in enumerate(self.welded_faces):
-            v1, v2, v3 = (self.unique_vertices[idx] for idx in indices)
+        # 1. Create Nodes
+        for i, indices in enumerate(self.raw_faces):
+            v1, v2, v3 = [self.raw_vertices[x] for x in indices]
             
-            # Cross product for Normal calculation (v2-v1) x (v3-v1)
-            ux, uy, uz = v2.x - v1.x, v2.y - v1.y, v2.z - v1.z
-            vx, vy, vz = v3.x - v1.x, v3.y - v1.y, v3.z - v1.z
-            nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
-            
+            # Normal Calc
+            ux, uy, uz = v2.x-v1.x, v2.y-v1.y, v2.z-v1.z
+            vx, vy, vz = v3.x-v1.x, v3.y-v1.y, v3.z-v1.z
+            nx, ny, nz = uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx
             length = math.sqrt(nx*nx + ny*ny + nz*nz)
             if length == 0: continue
-            ny /= length
             
-            # Check slope (Walkability: ny > 0.6)
-            if ny > self.slope_limit:
-                center = Vector3(
-                    (v1.x + v2.x + v3.x) / 3.0,
-                    (v1.y + v2.y + v3.y) / 3.0,
-                    (v1.z + v2.z + v3.z) / 3.0
-                )
-                node_idx = len(self.nodes)
-                self.nodes.append({
-                    'id': node_idx,
-                    'p': [round(center.x, 3), round(center.y, 3), round(center.z, 3)]
-                })
-                face_map[i] = node_idx
-                self.adjacency[node_idx] = []
+            if (ny/length) > self.slope_limit:
+                center = Vector3((v1.x+v2.x+v3.x)/3, (v1.y+v2.y+v3.y)/3, (v1.z+v2.z+v3.z)/3)
+                nid = len(self.nodes)
+                self.nodes.append({'id': nid, 'p': [round(center.x, 3), round(center.y, 3), round(center.z, 3)]})
+                face_map[i] = nid
+                self.adjacency[nid] = []
 
-        # Build Connections (Adjacency List from shared edges)
-        edge_to_nodes: Dict[Tuple[int, int], List[int]] = {}
+        # 2. Link Neighbors (Fuzzy Bridging)
+        grid = {}
+        grid_size = 1.5
         
-        for face_idx, node_idx in face_map.items():
-            indices = self.welded_faces[face_idx]
-            edges = [
-                tuple(sorted((indices[0], indices[1]))),
-                tuple(sorted((indices[1], indices[2]))),
-                tuple(sorted((indices[2], indices[0])))
-            ]
-            for edge in edges:
-                if edge not in edge_to_nodes: edge_to_nodes[edge] = []
-                edge_to_nodes[edge].append(node_idx)
+        for node in self.nodes:
+            gx, gy, gz = int(node['p'][0]/grid_size), int(node['p'][1]/grid_size), int(node['p'][2]/grid_size)
+            key = (gx, gy, gz)
+            if key not in grid: grid[key] = []
+            grid[key].append(node)
 
-        for nodes in edge_to_nodes.values():
-            if len(nodes) > 1:
-                for i in range(len(nodes)):
-                    for j in range(i + 1, len(nodes)):
-                        u, v = nodes[i], nodes[j]
-                        if v not in self.adjacency[u]:
-                            self.adjacency[u].append(v)
-                            self.adjacency[v].append(u)
-                            
+        MAX_DIST_SQ = self.bridge_dist ** 2
+        
+        for node in self.nodes:
+            gx, gy, gz = int(node['p'][0]/grid_size), int(node['p'][1]/grid_size), int(node['p'][2]/grid_size)
+            potential_neighbors = []
+            for dx in [-1,0,1]:
+                for dy in [-1,0,1]:
+                    for dz in [-1,0,1]:
+                        k = (gx+dx, gy+dy, gz+dz)
+                        if k in grid: potential_neighbors.extend(grid[k])
+            
+            px, py, pz = node['p']
+            for neighbor in potential_neighbors:
+                if neighbor['id'] == node['id']: continue
+                
+                nx, ny, nz = neighbor['p']
+                dist_sq = (px-nx)**2 + (py-ny)**2 + (pz-nz)**2
+                
+                if dist_sq < MAX_DIST_SQ:
+                    v_dist = abs(py-ny)
+                    if v_dist < 1.5: # Max step height
+                        if neighbor['id'] not in self.adjacency[node['id']]:
+                            self.adjacency[node['id']].append(neighbor['id'])
+                            if neighbor['id'] not in self.adjacency: self.adjacency[neighbor['id']] = []
+                            self.adjacency[neighbor['id']].append(node['id'])
+
     def save_json(self, output_path):
-        """Writes the graph to a JSON file."""
-        data = { "nodes": self.nodes, "adj": self.adjacency }
         with open(output_path, 'w') as f:
-            json.dump(data, f)
+            json.dump({ "nodes": self.nodes, "adj": self.adjacency }, f)
 
-# --- Main Execution ---
-
-def process_file(cob_path: str, output_dir: str):
-    """Handles the processing of a single COB file."""
+def process_file(input_path, output_folder):
     try:
-        filename = os.path.basename(cob_path)
-        json_filename = filename.replace('.cob', '.json')
-        output_path = os.path.join(output_dir, json_filename)
+        filename = os.path.basename(input_path)
+        print(f"Processing: {filename}...")
         
-        print(f"--- Processing: {filename} ---")
-        
-        pm = PathMaker(cob_path)
+        pm = PathMaker(input_path)
         pm.read_cob()
-        pm.weld_vertices()
+        pm.subdivide_geometry()
         pm.generate_graph()
-        pm.save_json(output_path)
         
-        print(f"SUCCESS: Saved to {output_path}")
+        out_name = os.path.splitext(filename)[0] + ".json"
+        out_path = os.path.join(output_folder, out_name)
+        
+        pm.save_json(out_path)
+        print(f"  -> Saved to {out_path} ({len(pm.nodes)} nodes)")
         return True
-
     except Exception as e:
-        print(f"ERROR: Failed to process {cob_path}. Reason: {e}")
+        print(f"  -> FAILED: {e}")
         return False
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="PathMaker V3: Batch converts all .cob files in a folder to navigation graph JSON files.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument(
-        "input_folder",
-        type=str,
-        help="Folder containing .cob collision mesh files to convert"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default="out",
-        help="Output folder name for JSON files (default: 'out')"
-    )
-    args = parser.parse_args()
+    if len(sys.argv) < 2:
+        print("Usage: python pathmaker.py <folder_or_file>")
+        return
 
-    input_dir = args.input_folder
-    output_dir = args.output
-
-    # Validate input folder
-    if not os.path.isdir(input_dir):
-        print(f"ERROR: Input folder not found: '{input_dir}'")
-        sys.exit(1)
-
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Input folder: {input_dir}")
-    print(f"Output folder: {output_dir}\n")
-
-    # Find all .cob files
-    cob_files = [
-        os.path.join(input_dir, f) 
-        for f in os.listdir(input_dir) 
-        if f.lower().endswith('.cob')
-    ]
+    input_arg = sys.argv[1]
     
-    if not cob_files:
-        print(f"No .cob files found in: {input_dir}")
-        sys.exit(0)
+    # Determine Input List and Output Directory
+    to_process = []
+    output_dir = ""
+    
+    if os.path.isdir(input_arg):
+        # Processing a folder
+        input_dir = input_arg
+        output_dir = "out"
+        for f in os.listdir(input_dir):
+            if f.lower().endswith(".cob"):
+                to_process.append(os.path.join(input_dir, f))
+    elif os.path.isfile(input_arg):
+        # Processing a single file
+        input_dir = os.path.dirname(input_arg)
+        output_dir = os.path.join(input_dir, "out") if input_dir else "out"
+        to_process.append(input_arg)
+    else:
+        print(f"Error: {input_arg} is not a valid file or directory.")
+        return
 
-    print(f"Found {len(cob_files)} .cob file(s) to process.\n")
+    if not to_process:
+        print("No .cob files found.")
+        return
 
-    # Process all files
+    # Create 'out' folder
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir)
+        except OSError as e:
+            print(f"Error creating output directory: {e}")
+            return
+
+    print(f"Found {len(to_process)} files. Outputting to: {output_dir}")
+    print("-" * 40)
+
     success_count = 0
-    for cob_path in cob_files:
-        if process_file(cob_path, output_dir):
+    for filepath in to_process:
+        if process_file(filepath, output_dir):
             success_count += 1
-        print()
-        
-    print("=" * 50)
-    print(f"Batch Processing Complete: {success_count}/{len(cob_files)} files converted successfully")
-    print(f"Output location: {os.path.abspath(output_dir)}")
-    print("=" * 50)
+
+    print("-" * 40)
+    print(f"Done. {success_count}/{len(to_process)} files processed successfully.")
 
 if __name__ == "__main__":
     main()
